@@ -91,6 +91,7 @@ class VideoDisplayComponent(QWidget):
         self.mask_data = None
         self.brush_size = 15
         self._last_paint_pos = None
+        self._last_preview_update_ms = 0  # for throttling preview refresh during paint drag
         self.section_masks = {}
         self._last_active_section_id = None
         
@@ -1191,35 +1192,29 @@ class VideoDisplayComponent(QWidget):
         if self.mask_data is None or not self.frame_width or not self.frame_height:
             return
         orig_x, orig_y = self._preview_to_original(px, py)
-        brush_r = self.brush_size
-        for dy in range(-brush_r, brush_r + 1):
-            for dx in range(-brush_r, brush_r + 1):
-                if dx * dx + dy * dy <= brush_r * brush_r:
-                    vy = orig_y + dy
-                    vx = orig_x + dx
-                    if 0 <= vy < self.frame_height and 0 <= vx < self.frame_width:
-                        self.mask_data[vy, vx] = 255
+        # cv2.circle handles clipping internally and runs in C, ~100-500x faster
+        # than the previous nested-Python-loop implementation.
+        cv2.circle(self.mask_data, (int(orig_x), int(orig_y)),
+                   int(self.brush_size), 255, thickness=-1)
 
     def _erase_on_mask(self, px, py):
         if self.mask_data is None or not self.frame_width or not self.frame_height:
             return
         orig_x, orig_y = self._preview_to_original(px, py)
-        brush_r = self.brush_size * 2
-        for dy in range(-brush_r, brush_r + 1):
-            for dx in range(-brush_r, brush_r + 1):
-                if dx * dx + dy * dy <= brush_r * brush_r:
-                    vy = orig_y + dy
-                    vx = orig_x + dx
-                    if 0 <= vy < self.frame_height and 0 <= vx < self.frame_width:
-                        self.mask_data[vy, vx] = 0
+        cv2.circle(self.mask_data, (int(orig_x), int(orig_y)),
+                   int(self.brush_size) * 2, 0, thickness=-1)
 
     def _paint_line(self, x0, y0, x1, y1):
-        steps = max(abs(x1 - x0), abs(y1 - y0), 1)
-        for i in range(steps + 1):
-            t = i / steps
-            px = int(x0 + (x1 - x0) * t)
-            py = int(y0 + (y1 - y0) * t)
-            self._paint_on_mask(px, py)
+        # Draw a thick line directly in C instead of stepping a Python loop
+        # and calling _paint_on_mask once per pixel. This gives a smooth
+        # continuous stroke at any drag speed.
+        if self.mask_data is None or not self.frame_width or not self.frame_height:
+            return
+        ox0, oy0 = self._preview_to_original(int(x0), int(y0))
+        ox1, oy1 = self._preview_to_original(int(x1), int(y1))
+        cv2.line(self.mask_data,
+                 (int(ox0), int(oy0)), (int(ox1), int(oy1)),
+                 255, thickness=int(self.brush_size) * 2)
 
     def _paint_mask_mouse_press(self, event):
         if event.button() == Qt.LeftButton:
@@ -1232,6 +1227,16 @@ class VideoDisplayComponent(QWidget):
             self.mask_changed.emit()
             self.update_preview_with_rect()
 
+    def _maybe_update_preview(self, force=False):
+        # Coalesce repaints during a drag so we redraw the preview at most
+        # ~33 fps instead of once per mouse pixel. Paint operations on the
+        # underlying mask still happen on every event; only the expensive
+        # cv2.resize + QImage rebuild path is throttled.
+        now_ms = int(QtCore.QDateTime.currentMSecsSinceEpoch())
+        if force or now_ms - self._last_preview_update_ms >= 30:
+            self._last_preview_update_ms = now_ms
+            self.update_preview_with_rect()
+
     def _paint_mask_mouse_move(self, event):
         if event.buttons() & Qt.LeftButton and self._last_paint_pos:
             x0, y0 = self._last_paint_pos
@@ -1239,15 +1244,18 @@ class VideoDisplayComponent(QWidget):
             self._paint_line(x0, y0, x1, y1)
             self._last_paint_pos = (x1, y1)
             self.mask_changed.emit()
-            self.update_preview_with_rect()
+            self._maybe_update_preview()
         elif event.buttons() & Qt.RightButton and self._last_paint_pos:
             self._erase_on_mask(event.pos().x(), event.pos().y())
             self._last_paint_pos = (event.pos().x(), event.pos().y())
             self.mask_changed.emit()
-            self.update_preview_with_rect()
+            self._maybe_update_preview()
 
     def _paint_mask_mouse_release(self, event):
         self._last_paint_pos = None
+        # Force a final repaint on release so the user sees the full stroke.
+        if self.paint_mask_mode:
+            self._maybe_update_preview(force=True)
 
     def closeEvent(self, event):
         try:

@@ -97,7 +97,8 @@ class Config(QConfig):
     # 【根据自己的GPU显存大小设置】最大同时处理的图片数量，设置越大处理效果越好，但是要求显存越高
     # 1280x720p视频设置80需要25G显存，设置50需要19G显存
     # 720x480p视频设置80需要8G显存，设置50需要7G显存
-    propainterMaxLoadNum = RangeConfigItem("ProPainter", "MaxLoadNum", 70, RangeValidator(1, 300))
+    # 默认 20 适配 ~8GB 显存的消费级显卡；高显存机器可以在设置界面里调大
+    propainterMaxLoadNum = RangeConfigItem("ProPainter", "MaxLoadNum", 20, RangeValidator(1, 300))
 
     # 是否使用硬件加速
     hardwareAcceleration = ConfigItem("Main", "HardwareAcceleration", HARDWARD_ACCELERATION_OPTION, BoolValidator())
