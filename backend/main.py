@@ -245,7 +245,20 @@ class SubtitleRemover:
         sub_detector = SubtitleDetect(self.video_path, self.sub_areas)
         sub_list = sub_detector.find_subtitle_frame_no(sub_remover=self)
         if len(sub_list) == 0:
-            raise Exception(tr['Main']['NoSubtitleDetected'].format(self.video_path))
+            # OCR 检测不到字幕（豆包水印、logo、图形水印等 OCR 识别不了的情况）
+            # Fall back: 用 sub_areas 作静态 mask，全片同一 mask 跑 ProPainter
+            # 这跟 STTN_AUTO 的逻辑等价——不依赖 OCR，直接按坐标处理
+            self.append_output(tr['Main']['NoSubtitleDetected'].format(self.video_path))
+            self.append_output("[Info] OCR 未检测到字幕，自动切换到静态 mask 模式（按 -c 坐标全片处理）")
+            mask_area_coordinates = []
+            for sub_area in self.sub_areas:
+                ymin, ymax, xmin, xmax = sub_area
+                mask_area_coordinates.append((xmin, xmax, ymin, ymax))
+            self.mask_data = create_mask(self.mask_size, mask_area_coordinates)
+            del sub_detector
+            gc.collect()
+            self._propainter_manual_mask(tbar)
+            return
         continuous_frame_no_list = sub_detector.find_continuous_ranges_with_same_mask(sub_list)
         scene_div_points = sub_detector.get_scene_div_frame_no(self.video_path)
         continuous_frame_no_list = sub_detector.split_range_by_scene(continuous_frame_no_list,
