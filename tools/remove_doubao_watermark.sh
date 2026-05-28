@@ -1,19 +1,30 @@
 #!/bin/bash
-# 豆包水印批量去除脚本 v2 (修正坐标)
-# 用法: ./remove_doubao_watermark.sh /输入文件夹 /输出文件夹
-# 默认坐标针对 1280x720 横屏。9:16 竖屏短剧需重新测坐标。
+# 豆包水印批量去除脚本 v3 (Linux/Mac/WSL)
+# 用法: ./remove_doubao_watermark.sh <输入文件夹> [输出文件夹] [模式]
+#   模式: propainter (默认，质量最好) | sttn-auto (快但有时残影)
+# 默认坐标针对 1280x720 横屏豆包视频。不同视频水印宽度不同，先用 measure_doubao_watermark_box.py 自测。
 
 INPUT_DIR="${1:-./input}"
 OUTPUT_DIR="${2:-./output}"
+MODE="${3:-propainter}"
 
-# 豆包水印坐标 (1280x720 横屏, 已实测可去除)
+# 豆包水印坐标 1280x720 (针对"豆包AI生成"5字水印实测)
 # 格式: YMIN YMAX XMIN XMAX
-TL_COORDS="5 105 30 290"        # 左上 (100x260 px)
-BR_COORDS="605 720 980 1240"    # 右下 (115x260 px)
+TL_COORDS="0 100 0 260"         # 左上 (100x260 px)
+BR_COORDS="620 700 1030 1280"   # 右下 (80x250 px)
 
 mkdir -p "$OUTPUT_DIR"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
+cd "$SCRIPT_DIR/.."
+
+# 自动激活项目自带的 videoEnv (如果存在)
+if [ -d "videoEnv" ]; then
+    if [ -f "videoEnv/bin/activate" ]; then
+        source videoEnv/bin/activate
+    elif [ -f "videoEnv/Scripts/activate" ]; then
+        source videoEnv/Scripts/activate
+    fi
+fi
 
 total=$(ls "$INPUT_DIR"/*.mp4 2>/dev/null | wc -l)
 if [ "$total" -eq 0 ]; then
@@ -22,6 +33,7 @@ if [ "$total" -eq 0 ]; then
 fi
 
 echo "📁 找到 $total 个视频文件"
+echo "🔧 模式: $MODE"
 echo "📍 水印坐标: TL=$TL_COORDS  BR=$BR_COORDS"
 echo ""
 
@@ -44,7 +56,7 @@ for video in "$INPUT_DIR"/*.mp4; do
         -o "$output" \
         -c $TL_COORDS \
         -c $BR_COORDS \
-        --inpaint-mode sttn-auto
+        --inpaint-mode "$MODE"
 
     if [ $? -eq 0 ]; then
         elapsed=$(($(date +%s) - start))
