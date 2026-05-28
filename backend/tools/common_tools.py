@@ -48,8 +48,10 @@ def get_readable_path(path):
     if sys.platform != 'win32':
         return path
     buf = ctypes.create_unicode_buffer(4096)
-    ctypes.windll.kernel32.GetShortPathNameW(path, buf, 4096)
-    return buf.value
+    result = ctypes.windll.kernel32.GetShortPathNameW(path, buf, 4096)
+    if result > 0 and buf.value:
+        return buf.value
+    return path
 
 def read_image(path):
     if os.path.getsize(path) > 100*1024*1024: # 100MB

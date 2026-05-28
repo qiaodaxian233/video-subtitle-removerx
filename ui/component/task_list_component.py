@@ -25,6 +25,8 @@ class TaskStatus(Enum):
 class TaskOptions(Enum):
     AB_SECTIONS = "ab_sections"
     SUB_AREAS = "sub_areas"
+    MASK_DATA = "mask_data"
+    SECTION_MASKS = "section_masks"
 
 @dataclass
 class Task:

@@ -156,7 +156,92 @@ class SubtitleRemover:
         """
         pass
 
+    def _propainter_manual_mask(self, tbar):
+        device = self.hardware_accelerator.device if self.hardware_accelerator.has_cuda() else torch.device("cpu")
+        propainter_inpaint = PropainterInpaint(device, self.model_config.PROPAINTER_MODEL_DIR, config.propainterMaxLoadNum.value)
+        self.append_output(tr['Main']['ProcessingStartRemovingSubtitles'])
+        max_batch = config.propainterMaxLoadNum.value
+        has_section_masks = hasattr(self, 'section_masks') and self.section_masks
+        if has_section_masks:
+            process_ranges = []
+            for section_id, mask in self.section_masks.items():
+                parts = section_id.split('_')
+                if len(parts) == 2:
+                    start = int(parts[0])
+                    end = int(parts[1])
+                    if np.any(mask):
+                        process_ranges.append((start, end, mask))
+            process_ranges.sort(key=lambda x: x[0])
+        reader = FramePrefetcher(self.video_cap)
+        index = 0
+        if has_section_masks:
+            for seg_start, seg_end, seg_mask in process_ranges:
+                while index < seg_start:
+                    ret, frame = reader.read()
+                    if not ret:
+                        return
+                    index += 1
+                    self.video_writer.write(frame)
+                    self.update_progress(tbar, increment=1)
+                batch = []
+                while index <= seg_end:
+                    ret, frame = reader.read()
+                    if not ret:
+                        break
+                    index += 1
+                    batch.append(frame)
+                    if len(batch) >= max_batch:
+                        inpainted = propainter_inpaint(batch, seg_mask)
+                        for f in inpainted:
+                            self.video_writer.write(f)
+                        self.update_progress(tbar, increment=len(batch))
+                        del batch, inpainted
+                        gc.collect()
+                        batch = []
+                if batch:
+                    inpainted = propainter_inpaint(batch, seg_mask)
+                    for f in inpainted:
+                        self.video_writer.write(f)
+                    self.update_progress(tbar, increment=len(batch))
+                    del batch, inpainted
+                    gc.collect()
+            while True:
+                ret, frame = reader.read()
+                if not ret:
+                    break
+                self.video_writer.write(frame)
+                self.update_progress(tbar, increment=1)
+        else:
+            mask = self.mask_data
+            frames_buffer = []
+            while True:
+                ret, frame = reader.read()
+                if not ret:
+                    break
+                index += 1
+                frames_buffer.append(frame)
+                if len(frames_buffer) >= max_batch:
+                    batch = frames_buffer[:max_batch]
+                    frames_buffer = frames_buffer[max_batch:]
+                    inpainted = propainter_inpaint(batch, mask)
+                    for f in inpainted:
+                        self.video_writer.write(f)
+                    self.update_progress(tbar, increment=len(batch))
+                    del batch, inpainted
+                    gc.collect()
+            if frames_buffer:
+                inpainted = propainter_inpaint(frames_buffer, mask)
+                for f in inpainted:
+                    self.video_writer.write(f)
+                self.update_progress(tbar, increment=len(frames_buffer))
+                del inpainted
+                gc.collect()
+
     def propainter_mode(self, tbar):
+        if (hasattr(self, 'mask_data') and self.mask_data is not None and np.any(self.mask_data)) or \
+           (hasattr(self, 'section_masks') and self.section_masks):
+            self._propainter_manual_mask(tbar)
+            return
         sub_detector = SubtitleDetect(self.video_path, self.sub_areas)
         sub_list = sub_detector.find_subtitle_frame_no(sub_remover=self)
         if len(sub_list) == 0:

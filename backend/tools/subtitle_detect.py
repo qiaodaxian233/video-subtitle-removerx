@@ -46,11 +46,35 @@ class SubtitleDetect:
         hardware_accelerator = HardwareAccelerator.instance()
         onnx_providers = hardware_accelerator.onnx_providers
         model_config = ModelConfig()
+        use_hpi = len(onnx_providers) > 0
+        if use_hpi:
+            try:
+                detector = TextDetection(
+                    model_name=model_config.DET_MODEL_NAME,
+                    model_dir=model_config.DET_MODEL_DIR,
+                    device="cpu",
+                    enable_hpi=True,
+                )
+                print('Subtitle detection uses HPIP (ONNX Runtime)')
+                return detector
+            except Exception:
+                print('HPIP not available, trying PaddlePaddle GPU mode...')
+        try:
+            detector = TextDetection(
+                model_name=model_config.DET_MODEL_NAME,
+                model_dir=model_config.DET_MODEL_DIR,
+                device="gpu",
+                enable_hpi=False,
+            )
+            print('Subtitle detection uses PaddlePaddle GPU mode')
+            return detector
+        except Exception:
+            print('PaddlePaddle GPU not available, falling back to CPU mode for subtitle detection.')
         return TextDetection(
             model_name=model_config.DET_MODEL_NAME,
             model_dir=model_config.DET_MODEL_DIR,
             device="cpu",
-            enable_hpi=len(onnx_providers) > 0,
+            enable_hpi=False,
         )
 
     def detect_subtitle(self, img):

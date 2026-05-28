@@ -6,6 +6,7 @@
 @desc: 字幕去除器图形化界面（由 PySimpleGUI 改写为 PySide6）
 """
 
+import torch
 import sys
 import os
 import configparser

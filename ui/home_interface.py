@@ -1,17 +1,20 @@
 import os
+import json
 import cv2
 import threading
 import multiprocessing
 import time
 import traceback
+import numpy as np
 from PySide6.QtWidgets import QWidget, QHBoxLayout, QVBoxLayout
-from PySide6.QtCore import Slot, QRect, Signal
+from PySide6.QtCore import Slot, QRect, Signal, Qt, QTimer
 from PySide6 import QtWidgets
 from datetime import datetime
-from qfluentwidgets import (PushButton, CardWidget, TextEdit, FluentIcon)
+from qfluentwidgets import (PushButton, CardWidget, TextEdit, FluentIcon, ToggleButton)
 from ui.setting_interface import SettingInterface
 from ui.component.video_display_component import VideoDisplayComponent
 from ui.component.task_list_component import TaskListComponent, TaskStatus, TaskOptions
+from ui.component.keyframe_timeline import KeyframeTimeline
 from ui.icon.my_fluent_icon import MyFluentIcon
 from backend.config import config, tr
 from backend.tools.constant import InpaintMode
@@ -52,6 +55,7 @@ class HomeInterface(QWidget):
         self.running_process = None
         self._saved_inpaint_mode = None  # 保存图片锁定前的 inpaint 模式
         self._video_cap_lock = threading.Lock()  # 保护 video_cap 的线程锁
+        self._is_manual_mask_processing = False  # 是否正在处理手动蒙版
 
         # 当前正在处理的任务索引
         self.current_processing_task_index = -1
@@ -79,13 +83,100 @@ class HomeInterface(QWidget):
         self.video_display_component = VideoDisplayComponent(self)
         self.video_display_component.ab_sections_changed.connect(self.ab_sections_changed)
         self.video_display_component.selections_changed.connect(self.selections_changed)
+        self.video_display_component.ab_sections_changed.connect(self._save_ab_sections)
         left_layout.addWidget(self.video_display_component)
         
         # 获取视频显示和滑块的引用
         self.video_display = self.video_display_component.video_display
         self.video_slider = self.video_display_component.video_slider
         self.video_slider.valueChanged.connect(self.slider_changed)
-        
+        self.video_slider.valueChanged.connect(self._on_slider_for_timeline)
+
+        self.mask_controls_container = CardWidget(self)
+        mask_layout = QHBoxLayout()
+        mask_layout.setContentsMargins(12, 8, 12, 8)
+        mask_layout.setSpacing(12)
+
+        self.paint_mask_toggle = ToggleButton('Paint Mask', self)
+        self.paint_mask_toggle.setToolTip("Left click to paint, right click to erase. Toggle to show/hide mask layer.")
+        self.paint_mask_toggle.toggled.connect(self._on_paint_mask_toggled)
+        mask_layout.addWidget(self.paint_mask_toggle)
+
+        from PySide6.QtWidgets import QLabel, QSlider as QHSlider
+        brush_label = QLabel('Brush: 15')
+        self.brush_size_label = brush_label
+        mask_layout.addWidget(brush_label)
+
+        self.brush_size_slider = QHSlider(Qt.Horizontal)
+        self.brush_size_slider.setMinimum(1)
+        self.brush_size_slider.setMaximum(80)
+        self.brush_size_slider.setValue(15)
+        self.brush_size_slider.setFixedWidth(120)
+        self.brush_size_slider.valueChanged.connect(self._on_brush_size_changed)
+        mask_layout.addWidget(self.brush_size_slider)
+
+        self.clear_mask_btn = PushButton('Clear Mask', self)
+        self.clear_mask_btn.setIcon(FluentIcon.DELETE)
+        self.clear_mask_btn.clicked.connect(self._on_clear_mask)
+        mask_layout.addWidget(self.clear_mask_btn)
+
+        self.auto_segment_btn = PushButton('Auto Segment', self)
+        self.auto_segment_btn.setIcon(FluentIcon.ROBOT)
+        self.auto_segment_btn.setToolTip('Auto-detect scene changes and create AB sections')
+        self.auto_segment_btn.clicked.connect(self._on_auto_segment)
+        mask_layout.addWidget(self.auto_segment_btn)
+
+        mask_layout.addStretch()
+        self.mask_controls_container.setLayout(mask_layout)
+        self.mask_controls_container.setVisible(False)
+        left_layout.addWidget(self.mask_controls_container)
+
+        self.mask_progress_bar = QtWidgets.QProgressBar(self)
+        self.mask_progress_bar.setRange(0, 100)
+        self.mask_progress_bar.setValue(0)
+        self.mask_progress_bar.setFixedHeight(8)
+        self.mask_progress_bar.setTextVisible(False)
+        self.mask_progress_bar.setVisible(False)
+        left_layout.addWidget(self.mask_progress_bar)
+
+        # 每次设置变更后重新根据 ProPainter 模式显隐蒙版控件
+        config.inpaintMode.valueChanged.connect(lambda v: self._update_mask_controls_visibility())
+        self._update_mask_controls_visibility()
+
+        self.keyframe_container = CardWidget(self)
+        kf_layout = QVBoxLayout()
+        kf_layout.setContentsMargins(12, 8, 12, 6)
+        kf_layout.setSpacing(4)
+
+        self.keyframe_timeline = KeyframeTimeline(self)
+        self.keyframe_timeline.seek_requested.connect(self._on_timeline_seek)
+        kf_layout.addWidget(self.keyframe_timeline)
+
+        kf_ctrl = QHBoxLayout()
+        kf_ctrl.setSpacing(6)
+        self.preset_combo = QtWidgets.QComboBox(self)
+        self.preset_combo.setMinimumWidth(100)
+        self.preset_combo.setToolTip('Select a saved preset')
+        kf_ctrl.addWidget(self.preset_combo, 1)
+
+        self.preset_save_btn = PushButton('Save', self)
+        self.preset_save_btn.clicked.connect(self._on_preset_save)
+        kf_ctrl.addWidget(self.preset_save_btn)
+
+        self.preset_load_btn = PushButton('Load', self)
+        self.preset_load_btn.clicked.connect(self._on_preset_load)
+        kf_ctrl.addWidget(self.preset_load_btn)
+
+        self.preset_delete_btn = PushButton('Del', self)
+        self.preset_delete_btn.clicked.connect(self._on_preset_delete)
+        kf_ctrl.addWidget(self.preset_delete_btn)
+
+        kf_layout.addLayout(kf_ctrl)
+        self.keyframe_container.setLayout(kf_layout)
+        is_propainter = config.inpaintMode.value == InpaintMode.PROPAINTER
+        self.keyframe_container.setVisible(is_propainter)
+        left_layout.addWidget(self.keyframe_container)
+
         # 输出文本区域
         self.output_text = TextEdit()
         self.output_text.setMinimumHeight(150)
@@ -165,6 +256,7 @@ class HomeInterface(QWidget):
 
     
     def slider_changed(self, value):
+        self.video_display_component._sync_section_mask()
         frame = None
         with self._video_cap_lock:
             if self.video_cap is not None and self.video_cap.isOpened():
@@ -174,22 +266,203 @@ class HomeInterface(QWidget):
                 if not ret:
                     frame = None
         if frame is not None:
-            # 更新预览图像
             self.update_preview(frame)
 
     def ab_sections_changed(self, ab_sections):
+        if hasattr(self, 'keyframe_timeline'):
+            self.keyframe_timeline.set_sections(ab_sections)
+        if not hasattr(self, 'task_list_component'):
+            return
         get_current_task_index = self.task_list_component.get_current_task_index()
         if get_current_task_index == -1:
             return
         self.task_list_component.update_task_option(get_current_task_index, TaskOptions.AB_SECTIONS, ab_sections)
 
     def selections_changed(self, selections):
+        if not hasattr(self, 'task_list_component'):
+            return
         get_current_task_index = self.task_list_component.get_current_task_index()
         if get_current_task_index == -1:
             return
         self.task_list_component.update_task_option(get_current_task_index, TaskOptions.SUB_AREAS, selections)
 
+    def _update_mask_controls_visibility(self):
+        is_propainter = config.inpaintMode.value == InpaintMode.PROPAINTER
+        self.mask_controls_container.setVisible(is_propainter)
+        self.video_display_component.set_propainter_mode(is_propainter)
+        if hasattr(self, 'keyframe_container'):
+            self.keyframe_container.setVisible(is_propainter)
+        if not is_propainter:
+            self.paint_mask_toggle.setChecked(False)
+            self.video_display_component.set_paint_mask_mode(False)
+            self.mask_progress_bar.setVisible(False)
+
+    def _on_paint_mask_toggled(self, checked):
+        self.video_display_component.set_paint_mask_mode(checked)
+
+    def _on_brush_size_changed(self, value):
+        self.video_display_component.set_brush_size(value)
+        self.brush_size_label.setText(f"Brush: {value}")
+
+    def _on_clear_mask(self):
+        self.video_display_component.clear_mask()
+
+    def _on_auto_segment(self):
+        if not self.video_path or not self.video_cap or self.frame_count <= 0:
+            return
+        self.auto_segment_btn.setEnabled(False)
+        self.auto_segment_btn.setText('Scanning...')
+        threading.Thread(target=self._auto_segment_worker, daemon=True).start()
+
+    def _auto_segment_worker(self):
+        try:
+            sample_interval = max(1, self.fps)
+            prev_hist = None
+            boundaries = []
+            with self._video_cap_lock:
+                cap = self.video_cap
+                if cap is None:
+                    return
+                total = self.frame_count
+                for fn in range(0, total, int(sample_interval)):
+                    if fn >= total:
+                        break
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, fn)
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    hist = cv2.calcHist([gray], [0], None, [64], [0, 256])
+                    hist = cv2.normalize(hist, hist).flatten()
+                    if prev_hist is not None:
+                        diff = cv2.compareHist(prev_hist, hist, cv2.HISTCMP_CHISQR)
+                        if diff > 0.5:
+                            boundaries.append(fn)
+                    prev_hist = hist
+            sections = []
+            if boundaries:
+                for i in range(len(boundaries) - 1):
+                    sections.append(range(boundaries[i], boundaries[i + 1]))
+            if sections:
+                self.video_display_component.set_ab_sections(sections)
+                self.append_log_signal.emit([f'Auto segment: {len(sections)} sections created'])
+            else:
+                self.append_log_signal.emit(['Auto segment: no scene changes detected'])
+        except Exception as e:
+            self.append_log_signal.emit([f'Auto segment error: {e}'])
+        finally:
+            self.auto_segment_btn.setEnabled(True)
+            self.auto_segment_btn.setText('Auto Segment')
+
+    def _ab_sections_file(self):
+        if not self.video_path:
+            return None
+        return os.path.splitext(self.video_path)[0] + '_ab_sections.json'
+
+    def _save_ab_sections(self, ab_sections):
+        filepath = self._ab_sections_file()
+        if not filepath:
+            return
+        try:
+            data = {'sections': [[s.start, s.stop - 1] for s in ab_sections]}
+            with open(filepath, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def _load_ab_sections(self):
+        filepath = self._ab_sections_file()
+        if not filepath or not os.path.exists(filepath):
+            return
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            sections = [range(s[0], s[1] + 1) for s in data.get('sections', [])]
+            if sections:
+                self.video_display_component.set_ab_sections(sections)
+        except Exception:
+            pass
+
+    def _on_timeline_seek(self, frame):
+        self.video_slider.setValue(frame)
+
+    def _on_slider_for_timeline(self, frame):
+        if hasattr(self, 'keyframe_timeline'):
+            self.keyframe_timeline.set_current_frame(frame)
+
+    def _presets_file(self):
+        if not self.video_path:
+            return None
+        return os.path.splitext(self.video_path)[0] + '_presets.json'
+
+    def _load_presets(self):
+        filepath = self._presets_file()
+        if not filepath or not os.path.exists(filepath):
+            return {}
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+    def _save_presets(self, presets):
+        filepath = self._presets_file()
+        if not filepath:
+            return
+        try:
+            with open(filepath, 'w', encoding='utf-8') as f:
+                json.dump(presets, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def _refresh_preset_combo(self):
+        self.preset_combo.clear()
+        presets = self._load_presets()
+        if presets:
+            self.preset_combo.addItems(sorted(presets.keys()))
+            self.preset_combo.setCurrentIndex(0)
+
+    def _on_preset_save(self):
+        name, ok = QtWidgets.QInputDialog.getText(self, 'Save Preset', 'Preset name:')
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        sections = self.video_display_component.get_ab_sections()
+        data = [[s.start, s.stop - 1] for s in sections]
+        presets = self._load_presets()
+        presets[name] = data
+        self._save_presets(presets)
+        self._refresh_preset_combo()
+        self.preset_combo.setCurrentText(name)
+
+    def _on_preset_load(self):
+        name = self.preset_combo.currentText()
+        if not name:
+            return
+        presets = self._load_presets()
+        if name not in presets:
+            return
+        sections = [range(s[0], s[1] + 1) for s in presets[name]]
+        self.video_display_component.set_ab_sections(sections)
+
+    def _on_preset_delete(self):
+        name = self.preset_combo.currentText()
+        if not name:
+            return
+        presets = self._load_presets()
+        if name in presets:
+            del presets[name]
+            self._save_presets(presets)
+            self._refresh_preset_combo()
+
     def on_task_selected(self, index, file_path):
+        try:
+            mask_data = self.task_list_component.get_task_option(index, TaskOptions.MASK_DATA, None)
+            if mask_data is not None:
+                self.video_display_component.mask_data = mask_data
+                self.video_display_component.update_preview_with_rect()
+        except Exception:
+            pass
         """处理任务被选中事件
         
         Args:
@@ -364,13 +637,24 @@ class HomeInterface(QWidget):
                                 if key == TaskOptions.SUB_AREAS.value:
                                     value = self.video_display_component.preview_coordinates_to_video_coordinates(value)
                                 options[key] = value
-                            # 清理缓存, 使用动态路径
+                            if self.paint_mask_toggle.isChecked() and self.video_display_component.mask_data is not None and np.any(self.video_display_component.mask_data):
+                                section_masks = self.video_display_component.get_section_masks()
+                                if section_masks:
+                                    options[TaskOptions.SECTION_MASKS.value] = section_masks
+                                else:
+                                    options[TaskOptions.MASK_DATA.value] = self.video_display_component.mask_data.copy()
+                                self._is_manual_mask_processing = True
+                                self.mask_progress_bar.setValue(0)
+                                self.mask_progress_bar.setVisible(True)
                             task_item.output_path = None
                             output_path = task_item.output_path
                             process = self.run_subtitle_remover_process(task_item.path, output_path, options)
 
                             # 检查是否在处理过程中被停止
                             if self._stop_event.is_set():
+                                if self._is_manual_mask_processing:
+                                    self._is_manual_mask_processing = False
+                                    self.mask_progress_bar.setVisible(False)
                                 break
 
                             # 更新任务状态为已完成
@@ -391,6 +675,9 @@ class HomeInterface(QWidget):
                                 self.task_status_signal.emit(self.current_processing_task_index, TaskStatus.FAILED)
                             break
                         finally:
+                            if self._is_manual_mask_processing:
+                                self._is_manual_mask_processing = False
+                                self.mask_progress_bar.setVisible(False)
                             with self._video_cap_lock:
                                 if self.video_cap:
                                     self.video_cap.release()
@@ -499,6 +786,8 @@ class HomeInterface(QWidget):
                     self.current_processing_task_index, 
                     progress_total,
                 )
+            if self._is_manual_mask_processing:
+                self.mask_progress_bar.setValue(progress_total)
             
             # 检查是否完成
             if isFinished:
@@ -592,9 +881,19 @@ class HomeInterface(QWidget):
         self.video_slider.setMaximum(self.frame_count)
         self.video_slider.setValue(1)
         self.video_display_component.set_dragger_enabled(True)
-        # 视频模式下恢复用户原始的 inpaint 模式选择
         self._unlock_inpaint_mode()
+        QTimer.singleShot(50, self._on_video_loaded_deferred)
         return True
+
+    def _on_video_loaded_deferred(self):
+        try:
+            if hasattr(self, 'keyframe_timeline'):
+                self.keyframe_timeline.set_total_frames(self.frame_count)
+                self.keyframe_timeline.set_current_frame(1)
+            self._load_ab_sections()
+            self._refresh_preset_combo()
+        except Exception:
+            pass
 
     def load_as_picture(self, path):
         if not is_image_file(path):

@@ -11,6 +11,7 @@ import torch
 import torchvision
 
 from backend import config
+from backend.tools.common_tools import get_readable_path
 from backend.inpaint.video.model.modules.flow_comp_raft import RAFT_bi
 from backend.inpaint.video.model.recurrent_flow_completion import RecurrentFlowCompleteNet
 from backend.inpaint.video.model.propainter import InpaintGenerator
@@ -419,7 +420,7 @@ class PropainterInpaint:
 
 
 def read_frames(v_path):
-    video_cap = cv2.VideoCapture(v_path)
+    video_cap = cv2.VideoCapture(get_readable_path(v_path))
     video_frames = []
     while True:
         ret, frame = video_cap.read()

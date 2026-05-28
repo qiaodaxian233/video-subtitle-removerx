@@ -1,18 +1,71 @@
 import cv2
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QMenu
+import numpy as np
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QMenu, QStyle, QStyleOptionSlider
 from PySide6.QtCore import Qt, Signal, QRect, QRectF, QObject, QEvent
-from PySide6.QtGui import QAction, QShortcut, QCursor
+from PySide6.QtGui import QAction, QShortcut, QCursor, QPainter, QColor, QBrush
 from PySide6 import QtCore, QtWidgets, QtGui 
 from qfluentwidgets import qconfig, CardWidget, HollowHandleStyle
 
 from backend.config import config, tr
 
+
+class SectionSlider(QtWidgets.QSlider):
+    sections_changed = Signal()
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._sections = []
+        self._colors = [
+            QColor(255, 100, 100, 90),
+            QColor(100, 180, 255, 90),
+            QColor(100, 255, 100, 90),
+            QColor(255, 200, 50, 90),
+            QColor(200, 100, 255, 90),
+        ]
+
+    def set_sections(self, sections):
+        self._sections = list(sections)
+        self.update()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if not self._sections or self.maximum() <= 0:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        opt = QStyleOptionSlider()
+        self.initStyleOption(opt)
+        groove = self.style().subControlRect(QStyle.CC_Slider, opt, QStyle.SC_SliderGroove, self)
+        if not groove.isValid():
+            painter.end()
+            return
+        total = self.maximum()
+        groove_x = groove.x()
+        groove_w = groove.width()
+        groove_y = groove.y() + 3
+        groove_h = groove.height() - 6
+        for i, section_range in enumerate(self._sections):
+            start = section_range.start if hasattr(section_range, 'start') else section_range[0]
+            end = section_range.stop if hasattr(section_range, 'stop') else section_range[1]
+            start = max(1, min(start, total))
+            end = max(1, min(end, total))
+            if start >= end:
+                continue
+            x = groove_x + int((start - 1) / total * groove_w)
+            w = int((end - start) / total * groove_w)
+            if w < 2:
+                w = 2
+            color = self._colors[i % len(self._colors)]
+            painter.fillRect(QRect(x, groove_y, w, groove_h), QBrush(color))
+        painter.end()
+
+
 class VideoDisplayComponent(QWidget):
     """视频显示组件，包含视频预览和选择框功能"""
     
-    # 定义信号
-    selections_changed = Signal(list)  # 选择框变化信号
-    ab_sections_changed = Signal(list)  # AB分区变化信号
+    selections_changed = Signal(list)
+    ab_sections_changed = Signal(list)
+    mask_changed = Signal()
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -31,6 +84,15 @@ class VideoDisplayComponent(QWidget):
         # AB分区标记相关变量
         self.ab_sections = []  # 存储AB分区标记 [range(start, end), ...]
         self.current_ab_start = -1  # 当前AB分区的起点
+        self._propainter_active = False  # ProPainter模式激活时，完全关闭选框功能
+
+        # 蒙版绘制相关变量
+        self.paint_mask_mode = False
+        self.mask_data = None
+        self.brush_size = 15
+        self._last_paint_pos = None
+        self.section_masks = {}
+        self._last_active_section_id = None
         
         # 创建右键菜单
         self.__init_context_menu()
@@ -106,10 +168,10 @@ class VideoDisplayComponent(QWidget):
         self.video_display.mouseReleaseEvent = self.selection_mouse_release
         
         # 视频滑块
-        self.video_slider = QtWidgets.QSlider(Qt.Horizontal)
+        self.video_slider = SectionSlider(Qt.Horizontal)
         self.video_slider.setMinimum(1)
         self.video_slider.setFixedHeight(22)
-        self.video_slider.setMaximum(100)  # 默认最大值设为100，与进度百分比一致
+        self.video_slider.setMaximum(100)
         self.video_slider.setValue(1)
         self.video_slider.setStyle(HollowHandleStyle({
             "handle.color": QtGui.QColor(255, 255, 255),
@@ -117,6 +179,7 @@ class VideoDisplayComponent(QWidget):
             "handle.hollow-radius": 6,
             "handle.margin": 1
         }))
+        self.ab_sections_changed.connect(lambda sections: self.video_slider.set_sections(sections))
         
         # 视频预览区域
         self.video_display.setObjectName('videoDisplay')
@@ -271,7 +334,7 @@ class VideoDisplayComponent(QWidget):
         painter = QtGui.QPainter(pixmap_copy)
         
         # 绘制所有选区
-        if draw_selection:
+        if draw_selection and not self.paint_mask_mode and not self._propainter_active:
             # 计算缩放比例
             display_size = self.video_display.size()
             pixmap_size = self.current_pixmap.size()
@@ -341,6 +404,12 @@ class VideoDisplayComponent(QWidget):
                 end_x = left_margin + int((section_range.stop / total_frames) * available_width)
                 
                 # 绘制AB分区矩形
+                section_id = self._section_id(section_range)
+                has_mask = section_id in self.section_masks and np.any(self.section_masks[section_id])
+                if has_mask:
+                    painter.setBrush(QtGui.QColor(255, 80, 80, 200))
+                else:
+                    painter.setBrush(QtGui.QColor(255, 255, 255, 128))
                 painter.drawRect(start_x, ab_rect_y, end_x - start_x, ab_rect_height)
         
         # 绘制current_ab_start的高亮竖线
@@ -363,19 +432,38 @@ class VideoDisplayComponent(QWidget):
             ab_line_y = pixmap_copy.height() - ab_line_height
             painter.drawLine(start_x, ab_line_y, start_x, pixmap_copy.height())
         
+        if self.mask_data is not None and draw_selection:
+            mask = self.mask_data
+            if self.paint_mask_mode:
+                mask_h, mask_w = mask.shape
+                p_w = pixmap_copy.width()
+                p_h = pixmap_copy.height()
+                overlay_h = int(self.scaled_height * p_h) if self.scaled_height and p_h else 0
+                overlay_w = int(self.scaled_width * p_w) if self.scaled_width and p_w else 0
+                if overlay_h > 0 and overlay_w > 0 and mask_h > 0 and mask_w > 0:
+                    mask_resized = cv2.resize(mask, (overlay_w, overlay_h), interpolation=cv2.INTER_NEAREST)
+                    overlay_rgba = np.zeros((overlay_h, overlay_w, 4), dtype=np.uint8)
+                    overlay_rgba[mask_resized > 0] = [255, 60, 60, 120]
+                    overlay_img = QtGui.QImage(overlay_rgba.data, overlay_w, overlay_h, overlay_w * 4, QtGui.QImage.Format_RGBA8888)
+                    overlay_pix = QtGui.QPixmap.fromImage(overlay_img.copy())
+                    overlay_x = int(self.border_left * p_w) if self.border_left else 0
+                    overlay_y = int(self.border_top * p_h) if self.border_top else 0
+                    painter.setCompositionMode(QtGui.QPainter.CompositionMode_SourceOver)
+                    painter.drawPixmap(overlay_x, overlay_y, overlay_pix)
+
         painter.end()
         
         # 更新显示
         self.video_display.setPixmap(pixmap_copy)
     
     def selection_mouse_press(self, event):
-        """鼠标按下事件处理"""
         if not self.enable_mouse_events:
             return
-        
-        # 右键点击显示上下文菜单
-        if event.button() == Qt.RightButton:
-            self.context_menu.exec_(event.globalPos())
+
+        if self.paint_mask_mode:
+            self._paint_mask_mouse_press(event)
+            return
+        if self._propainter_active:
             return
         
         video_display_width = self.video_display.width()
@@ -502,8 +590,13 @@ class VideoDisplayComponent(QWidget):
         return None
 
     def selection_mouse_move(self, event):
-        """鼠标移动事件处理"""
         if not self.enable_mouse_events:
+            return
+
+        if self.paint_mask_mode:
+            self._paint_mask_mouse_move(event)
+            return
+        if self._propainter_active:
             return
         
         video_display_width = self.video_display.width()
@@ -571,8 +664,13 @@ class VideoDisplayComponent(QWidget):
             self.update_cursor_shape(pos)
     
     def selection_mouse_release(self, event):
-        """鼠标释放事件处理"""
         if not self.enable_mouse_events:
+            return
+
+        if self.paint_mask_mode:
+            self._paint_mask_mouse_release(event)
+            return
+        if self._propainter_active:
             return
             
         # 结束绘制或调整
@@ -873,8 +971,8 @@ class VideoDisplayComponent(QWidget):
             adjusted = False
             for i, section_range in enumerate(self.ab_sections):
                 if current_frame in section_range:
-                    # 调整已有区间的起点
                     self.ab_sections[i] = range(current_frame, section_range.stop)
+                    self.ab_sections_changed.emit(self.ab_sections)
                     adjusted = True
                     break
             
@@ -895,8 +993,8 @@ class VideoDisplayComponent(QWidget):
             adjusted = False
             for i, section_range in enumerate(self.ab_sections):
                 if current_frame in section_range:
-                    # 调整已有区间的终点
                     self.ab_sections[i] = range(section_range.start, current_frame + 1)
+                    self.ab_sections_changed.emit(self.ab_sections)
                     adjusted = True
                     break
             
@@ -919,7 +1017,12 @@ class VideoDisplayComponent(QWidget):
             for i, section_range in enumerate(self.ab_sections):
                 if current_frame in section_range:
                     # 删除该AB区块
+                    section_id = self._section_id(section_range)
                     self.ab_sections.pop(i)
+                    self.section_masks.pop(section_id, None)
+                    if self._last_active_section_id == section_id:
+                        self._last_active_section_id = None
+                        self.mask_data = None
                     
                     # 如果当前有标记的起点，且在被删除的区块内，重置起点
                     if self.current_ab_start in section_range:
@@ -991,18 +1094,163 @@ class VideoDisplayComponent(QWidget):
     def set_ab_sections(self, sections):
         """设置AB分区标记"""
         self.ab_sections = sections
+        self.ab_sections_changed.emit(self.ab_sections)
         self.update_preview_with_rect()
 
     def clear_ab_sections(self):
-        """清除所有AB分区标记"""
         self.ab_sections = []
         self.current_ab_start = -1
+        self.ab_sections_changed.emit(self.ab_sections)
         self.update_preview_with_rect()
 
+    def _preview_to_original(self, px, py):
+        video_display_width = self.video_display.width()
+        video_display_height = self.video_display.height()
+        x_adj = (px - self.border_left * video_display_width) / (self.scaled_width * video_display_width) if self.scaled_width and video_display_width else 0
+        y_adj = (py - self.border_top * video_display_height) / (self.scaled_height * video_display_height) if self.scaled_height and video_display_height else 0
+        orig_x = int(x_adj * self.frame_width)
+        orig_y = int(y_adj * self.frame_height)
+        orig_x = max(0, min(orig_x, self.frame_width - 1)) if self.frame_width else 0
+        orig_y = max(0, min(orig_y, self.frame_height - 1)) if self.frame_height else 0
+        return orig_x, orig_y
+
+    def set_paint_mask_mode(self, enabled):
+        self.paint_mask_mode = enabled
+        if enabled:
+            self.video_display.setCursor(Qt.CrossCursor)
+            self._sync_section_mask()
+            if self.mask_data is None and self.frame_width and self.frame_height:
+                self.mask_data = np.zeros((self.frame_height, self.frame_width), dtype=np.uint8)
+        else:
+            self._sync_section_mask()
+            self.mask_data = None
+            self.video_display.setCursor(Qt.ArrowCursor)
+        self.update_preview_with_rect()
+
+    def set_propainter_mode(self, active):
+        self._propainter_active = active
+        if active:
+            self.clear_selections()
+
+    def _section_id(self, section_range):
+        return f"{section_range.start}_{section_range.stop - 1}"
+
+    def _get_active_section_range(self):
+        current_frame = self.video_slider.value()
+        for section_range in self.ab_sections:
+            if current_frame in section_range:
+                return section_range
+        return None
+
+    def _sync_section_mask(self):
+        active_range = self._get_active_section_range()
+        if active_range:
+            section_id = self._section_id(active_range)
+            if self._last_active_section_id and self._last_active_section_id != section_id:
+                if self.mask_data is not None:
+                    self.section_masks[self._last_active_section_id] = self.mask_data.copy()
+            if self._last_active_section_id != section_id:
+                self._last_active_section_id = section_id
+                if section_id in self.section_masks:
+                    self.mask_data = self.section_masks[section_id].copy()
+                else:
+                    if self.paint_mask_mode and self.frame_width and self.frame_height:
+                        self.mask_data = np.zeros((self.frame_height, self.frame_width), dtype=np.uint8)
+                    else:
+                        self.mask_data = None
+        else:
+            if self._last_active_section_id and self.mask_data is not None:
+                self.section_masks[self._last_active_section_id] = self.mask_data.copy()
+            self._last_active_section_id = None
+            if not self.paint_mask_mode:
+                self.mask_data = None
+
+    def clear_mask(self):
+        if self.frame_width and self.frame_height:
+            self.mask_data = np.zeros((self.frame_height, self.frame_width), dtype=np.uint8)
+        else:
+            self.mask_data = None
+        if self._last_active_section_id:
+            self.section_masks.pop(self._last_active_section_id, None)
+        self.mask_changed.emit()
+        self.update_preview_with_rect()
+
+    def get_mask_data(self):
+        return self.mask_data
+
+    def get_section_masks(self):
+        self._sync_section_mask()
+        if self._last_active_section_id and self.mask_data is not None:
+            self.section_masks[self._last_active_section_id] = self.mask_data.copy()
+        return dict(self.section_masks) if self.section_masks else None
+
+    def set_brush_size(self, size):
+        self.brush_size = max(1, min(size, 100))
+
+    def _paint_on_mask(self, px, py):
+        if self.mask_data is None or not self.frame_width or not self.frame_height:
+            return
+        orig_x, orig_y = self._preview_to_original(px, py)
+        brush_r = self.brush_size
+        for dy in range(-brush_r, brush_r + 1):
+            for dx in range(-brush_r, brush_r + 1):
+                if dx * dx + dy * dy <= brush_r * brush_r:
+                    vy = orig_y + dy
+                    vx = orig_x + dx
+                    if 0 <= vy < self.frame_height and 0 <= vx < self.frame_width:
+                        self.mask_data[vy, vx] = 255
+
+    def _erase_on_mask(self, px, py):
+        if self.mask_data is None or not self.frame_width or not self.frame_height:
+            return
+        orig_x, orig_y = self._preview_to_original(px, py)
+        brush_r = self.brush_size * 2
+        for dy in range(-brush_r, brush_r + 1):
+            for dx in range(-brush_r, brush_r + 1):
+                if dx * dx + dy * dy <= brush_r * brush_r:
+                    vy = orig_y + dy
+                    vx = orig_x + dx
+                    if 0 <= vy < self.frame_height and 0 <= vx < self.frame_width:
+                        self.mask_data[vy, vx] = 0
+
+    def _paint_line(self, x0, y0, x1, y1):
+        steps = max(abs(x1 - x0), abs(y1 - y0), 1)
+        for i in range(steps + 1):
+            t = i / steps
+            px = int(x0 + (x1 - x0) * t)
+            py = int(y0 + (y1 - y0) * t)
+            self._paint_on_mask(px, py)
+
+    def _paint_mask_mouse_press(self, event):
+        if event.button() == Qt.LeftButton:
+            self._last_paint_pos = (event.pos().x(), event.pos().y())
+            self._paint_on_mask(event.pos().x(), event.pos().y())
+            self.mask_changed.emit()
+            self.update_preview_with_rect()
+        elif event.button() == Qt.RightButton:
+            self._erase_on_mask(event.pos().x(), event.pos().y())
+            self.mask_changed.emit()
+            self.update_preview_with_rect()
+
+    def _paint_mask_mouse_move(self, event):
+        if event.buttons() & Qt.LeftButton and self._last_paint_pos:
+            x0, y0 = self._last_paint_pos
+            x1, y1 = event.pos().x(), event.pos().y()
+            self._paint_line(x0, y0, x1, y1)
+            self._last_paint_pos = (x1, y1)
+            self.mask_changed.emit()
+            self.update_preview_with_rect()
+        elif event.buttons() & Qt.RightButton and self._last_paint_pos:
+            self._erase_on_mask(event.pos().x(), event.pos().y())
+            self._last_paint_pos = (event.pos().x(), event.pos().y())
+            self.mask_changed.emit()
+            self.update_preview_with_rect()
+
+    def _paint_mask_mouse_release(self, event):
+        self._last_paint_pos = None
+
     def closeEvent(self, event):
-        """窗口关闭时断开信号连接"""
         try:
-            # 断开信号连接
             self.shortcut_ab_start.activated.disconnect(self.__handle_mark_for_ab_start)
             self.shortcut_ab_end.activated.disconnect(self.__handle_mark_for_ab_end)
             self.shortcut_ab_delete.activated.disconnect(self.__handle_delete_ab_section)
